@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchCatalog, formatTierLabel, groupByCatalog } from "../api/models";
+import { fetchCatalog, groupByCatalog } from "../api/models";
 import type { CatalogGroup } from "../api/models";
 import type { ModelRule } from "../types";
 import { useT } from "../i18n";
@@ -11,11 +11,8 @@ interface Props {
   onChange: (rules: ModelRule[]) => void;
 }
 
-// Multi-select picker over CPA's available models, grouped by provider and —
-// for providers whose auth files carry a tier/plan identity (codex, antigravity)
-// or a custom classify group — further split into subgroups (codex · free /
-// 自定义 · vip …). Selecting a model under a group pins that group into the
-// ModelRule, which the plugin Scheduler honors at runtime.
+// Multi-select picker over CPA's global native model list. New selections use
+// model-name-only rules so CPA's native routing remains in control.
 
 export default function ModelPicker({ initial, onChange }: Props) {
   const t = useT();
@@ -24,10 +21,8 @@ export default function ModelPicker({ initial, onChange }: Props) {
   const [error, setError] = useState<string>("");
   const [query, setQuery] = useState("");
 
-  // Selection key: "provider|group|model" (all lowercased for dedupe matching).
-  // group is "" for non-tiered providers. A model selected under two tiers is
-  // two independent keys — authorizing it under "team" does not also authorize
-  // it under "free".
+  // Selection key: "provider|group|model" (all lowercased). New catalog rows
+  // have empty provider and group; non-empty legacy keys remain preservable.
   const [selected, setSelected] = useState<Set<string>>(() => {
     const s = new Set<string>();
     for (const r of initial ?? []) {
@@ -43,15 +38,7 @@ export default function ModelPicker({ initial, onChange }: Props) {
       setLoading(true);
       setError("");
       try {
-        // Pass the providers already bound to this key (edit-mode prefill) so
-        // fetchCatalog keeps those channels visible even when their credential
-        // has since been removed — the user can still see and uncheck their
-        // rows. New-key mode has no initial rules, so only configured channels
-        // appear.
-        const selectedProviders = new Set(
-          (initial ?? []).map((r) => r.provider.toLowerCase()),
-        );
-        const cat = await fetchCatalog(selectedProviders);
+        const cat = await fetchCatalog();
         if (!alive) return;
         setGroups(groupByCatalog(cat));
       } catch (e) {
@@ -64,6 +51,16 @@ export default function ModelPicker({ initial, onChange }: Props) {
     return () => {
       alive = false;
     };
+  }, []);
+
+  const initialBySelectionKey = useMemo(() => {
+    const byKey = new Map<string, ModelRule[]>();
+    for (const rule of initial ?? []) {
+      const group = (rule.group ?? "").toLowerCase();
+      const key = rule.provider.toLowerCase() + "|" + group + "|" + rule.target_model.toLowerCase();
+      byKey.set(key, [...(byKey.get(key) ?? []), rule]);
+    }
+    return byKey;
   }, []);
 
   // emit ModelRule[] whenever selection (or available groups) change.
@@ -84,32 +81,30 @@ export default function ModelPicker({ initial, onChange }: Props) {
         const key = g.provider + "|" + gkey + "|" + m.toLowerCase();
         covered.add(key);
         if (selected.has(key)) {
-          const rule: ModelRule = { alias: m, provider: g.provider, target_model: m };
-          if (g.group) rule.group = g.group;
-          rules.push(rule);
+          const originals = initialBySelectionKey.get(key);
+          rules.push(...(originals ?? [{ alias: m, provider: "", target_model: m }]));
         }
       }
     }
-    // Preserve selected entries the catalog no longer covers. This matters for
-    // editing a key created before tier grouping shipped: its codex rows have
-    // group="" but the new catalog lists codex only under tier subgroups, so
-    // the "codex||model" selection key wouldn't match any checkbox. Without
-    // this pass the row would be silently dropped on save, losing the model
-    // from the key. Re-emitting the stale entry keeps it (as legacy "any auth
-    // for the provider" — the plugin Scheduler defers when group is empty), so
-    // upgrading never degrades an existing key. The user can re-pick it under a
-    // tier to opt into isolation.
+    // Preserve legacy routed rules that are absent from the global model list
+    // so editing a key never silently removes an existing authorization.
     for (const key of selected) {
       if (covered.has(key)) continue;
       const [provider, group, ...rest] = key.split("|");
       const model = rest.join("|");
-      if (!provider || !model) continue;
+      if (!model) continue;
+      const originals = initialBySelectionKey.get(key);
+      if (originals) {
+        rules.push(...originals);
+        continue;
+      }
+      if (!provider) continue;
       const rule: ModelRule = { alias: model, provider, target_model: model };
       if (group) rule.group = group;
       rules.push(rule);
     }
     onChange(rules);
-  }, [selected, groups, onChange]);
+  }, [selected, groups, onChange, initialBySelectionKey]);
 
   const filtered = useMemo(() => {
     if (!query.trim()) return groups;
@@ -119,7 +114,7 @@ export default function ModelPicker({ initial, onChange }: Props) {
         provider: g.provider,
         group: g.group,
         models: g.models.filter(
-          (m) => m.toLowerCase().includes(q) || g.provider.includes(q) || (g.group ?? "").includes(q),
+          (m) => m.toLowerCase().includes(q),
         ),
       }))
       .filter((g) => g.models.length > 0);
@@ -172,11 +167,10 @@ export default function ModelPicker({ initial, onChange }: Props) {
         {t("picker.selected", { count: selected.size })}
       </div>
       {filtered.map((g) => {
-        const groupLabel = g.group ? formatTierLabel(t, g.group) : "";
-        const head = g.provider + (groupLabel ? " · " + groupLabel : "");
+        const head = g.provider || t("picker.title");
         const allSelected = g.models.every((m) => selected.has(keyOf(g, m)));
         return (
-          <div className="picker-group" key={head}>
+          <div className="picker-group" key={g.provider + "|" + (g.group ?? "")}>
             <div className="pg-head">
               <span>{head}</span>
               <span className="pg-actions">

@@ -132,6 +132,12 @@ func (s *Store) Configure(cfg Config) error {
 		if len(stateRules) == 0 && len(state.ClassifyRules) > 0 {
 			stateRules = state.ClassifyRules
 		}
+		// Keep direct providerless rules before normalization mutates the state
+		// key slice during legacy provider-backed migration.
+		directByKey := make(map[string][]ModelRule, len(keys))
+		for _, key := range keys {
+			directByKey[key.ID] = providerlessModelRules(key.Models)
+		}
 		// Validate state keys against the global alias table. normalizeConfig
 		// also auto-migrates any state keys still using per-key Models.
 		merged := Config{Enabled: cfg.Enabled, StateFile: cfg.StateFile, Keys: keys, Aliases: stateAliases, ClassifyRules: stateRules}
@@ -139,6 +145,11 @@ func (s *Store) Configure(cfg Config) error {
 			return fmt.Errorf("load state: %w", errNorm)
 		}
 		keys = merged.Keys
+		// normalizeConfig intentionally retains direct providerless rules. Keep
+		// them separate from alias-derived runtime Models while rebuilding keys.
+		for i := range keys {
+			keys[i].Models = directByKey[keys[i].ID]
+		}
 		// Propagate the resolved alias table back to cfg for downstream use.
 		cfg.Aliases = merged.Aliases
 		cfg.ClassifyRules = merged.ClassifyRules
@@ -164,13 +175,11 @@ func (s *Store) Configure(cfg Config) error {
 		if item.UpdatedAt.IsZero() {
 			item.UpdatedAt = item.CreatedAt
 		}
-		// If the key has Aliases refs, populate Models from the global table
-		// so all downstream code (routing, billing, usage) works
-		// unchanged. For round-robin aliases with multiple targets, we expand
-		// to one ModelRule per target (the scheduler picks based on group).
-		if len(item.Aliases) > 0 {
-			item.Models = resolveAliasRefsToModels(item.Aliases, aliasLookup)
-		}
+		// Providerless Models are direct per-key native-routing allowlists. Merge
+		// them with alias-derived provider-backed Models for runtime routing.
+		directModels := providerlessModelRules(item.Models)
+		item.Models = append(directModels, resolveAliasRefsToModels(item.Aliases, aliasLookup)...)
+
 		next[item.ID] = &item
 	}
 
@@ -388,7 +397,14 @@ func (s *Store) resolveRuleForAlias(key *KeyConfig, requested string) (ModelRule
 	if len(matches) == 1 {
 		return matches[0], true
 	}
-	// Multiple targets: dispatch mode + RR counter need the store lock.
+	// Direct providerless rules are exact-model authorizations and must never
+	// enter alias dispatch. Prefer them over same-named legacy routed aliases.
+	for _, match := range matches {
+		if isProviderlessModelRule(match) && strings.EqualFold(match.TargetModel, requested) {
+			return match, true
+		}
+	}
+	// Multiple routed targets: dispatch mode + RR counter need the store lock.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	aliasName := strings.ToLower(strings.TrimSpace(requested))
@@ -945,14 +961,14 @@ func (s *Store) UpsertKey(input KeyConfig, persist bool) error {
 		key.CreatedAt = now
 	}
 	key.UpdatedAt = now
-	// Populate Models from the key's Alias refs + global table for downstream use.
-	if len(key.Aliases) > 0 {
-		aliasLookup := make(map[string]*AliasMapping, len(cfg.Aliases))
-		for i := range cfg.Aliases {
-			aliasLookup[strings.ToLower(cfg.Aliases[i].Alias)] = &cfg.Aliases[i]
-		}
-		key.Models = resolveAliasRefsToModels(key.Aliases, aliasLookup)
+	// Keep direct providerless rules alongside Models derived from alias refs.
+	directModels := providerlessModelRules(key.Models)
+	aliasLookup := make(map[string]*AliasMapping, len(cfg.Aliases))
+	for i := range cfg.Aliases {
+		aliasLookup[strings.ToLower(cfg.Aliases[i].Alias)] = &cfg.Aliases[i]
 	}
+	key.Models = append(directModels, resolveAliasRefsToModels(key.Aliases, aliasLookup)...)
+
 	s.keys[key.ID] = &key
 	s.rebuildKeysByHashLocked()
 	s.clearPendingPicksForKeyLocked(key.ID)

@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
-import { fetchCatalog, formatTierLabel, groupByCatalog } from "../api/models";
+import { fetchCatalog, groupByCatalog } from "../api/models";
 import type { CatalogGroup } from "../api/models";
-import type { ModelRule, AliasTarget } from "../types";
+import type { ModelRule } from "../types";
 import { useT } from "../i18n";
 
 // Selection key: "provider|group|model" (all lowercased for dedupe matching).
@@ -22,32 +22,15 @@ export default function ModelPick() {
 
   // Initial selection comes from router state (passed by KeyForm when it
   // navigates here). Edit-mode keys pass their current models in too.
-  const st = loc.state as {
-    models?: ModelRule[];
-    currentTargets?: AliasTarget[];
-    returnTo?: string;
-    /** Full alias form draft — forwarded back so name/dispatch/prices survive. */
-    draftAlias?: unknown;
-  } | null;
-  // Context-aware: if a `returnTo` route is supplied (e.g. from the alias
-  // editor), we are picking targets for a global alias, not models for a key.
-  const aliasMode = !!st?.returnTo;
+  const st = loc.state as { models?: ModelRule[] } | null;
   const initialModels = st?.models ?? [];
-  const initialTargets = st?.currentTargets ?? [];
-  const backTo = aliasMode
-    ? st!.returnTo!
-    : (id ? `/keys/${encodeURIComponent(id)}/edit` : "/keys/new");
-  const draftAlias = st?.draftAlias;
+  const backTo = id ? `/keys/${encodeURIComponent(id)}/edit` : "/keys/new";
 
   const [selected, setSelected] = useState<Set<string>>(() => {
     const s = new Set<string>();
     for (const r of initialModels) {
       const g = (r.group ?? "").toLowerCase();
       s.add(r.provider.toLowerCase() + "|" + g + "|" + r.target_model.toLowerCase());
-    }
-    for (const tg of initialTargets) {
-      const g = (tg.group ?? "").toLowerCase();
-      s.add(tg.provider.toLowerCase() + "|" + g + "|" + tg.target_model.toLowerCase());
     }
     return s;
   });
@@ -58,10 +41,7 @@ export default function ModelPick() {
       setLoading(true);
       setError("");
       try {
-        const selectedProviders = new Set<string>();
-        for (const r of initialModels) selectedProviders.add(r.provider.toLowerCase());
-        for (const r of initialTargets) selectedProviders.add(r.provider.toLowerCase());
-        const cat = await fetchCatalog(selectedProviders);
+        const cat = await fetchCatalog();
         if (!alive) return;
         setGroups(groupByCatalog(cat));
       } catch (e) {
@@ -75,9 +55,17 @@ export default function ModelPick() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Build the ModelRule[] for the current selection. Includes stale entries
-  // the catalog no longer covers (legacy edit-mode rows), so upgrading never
-  // drops a model from an existing key.
+  const initialBySelectionKey = useMemo(() => {
+    const byKey = new Map<string, ModelRule[]>();
+    for (const rule of initialModels) {
+      const key = rule.provider.toLowerCase() + "|" + (rule.group ?? "").toLowerCase() + "|" + rule.target_model.toLowerCase();
+      byKey.set(key, [...(byKey.get(key) ?? []), rule]);
+    }
+    return byKey;
+  }, [initialModels]);
+
+  // Build rules for the current selection. Legacy entries outside the global
+  // catalog remain intact until explicitly removed.
   const rules: ModelRule[] = useMemo(() => {
     const covered = new Set<string>();
     const out: ModelRule[] = [];
@@ -86,9 +74,8 @@ export default function ModelPick() {
         const k = keyOf(g, m);
         covered.add(k);
         if (selected.has(k)) {
-          const rule: ModelRule = { alias: m, provider: g.provider, target_model: m };
-          if (g.group) rule.group = g.group;
-          out.push(rule);
+          const originals = initialBySelectionKey.get(k);
+          out.push(...(originals ?? [{ alias: m, provider: "", target_model: m }]));
         }
       }
     }
@@ -96,13 +83,19 @@ export default function ModelPick() {
       if (covered.has(k)) continue;
       const [provider, group, ...rest] = k.split("|");
       const model = rest.join("|");
-      if (!provider || !model) continue;
+      if (!model) continue;
+      const originals = initialBySelectionKey.get(k);
+      if (originals) {
+        out.push(...originals);
+        continue;
+      }
+      if (!provider) continue;
       const rule: ModelRule = { alias: model, provider, target_model: model };
       if (group) rule.group = group;
       out.push(rule);
     }
     return out;
-  }, [selected, groups]);
+  }, [selected, groups, initialBySelectionKey]);
 
   const filtered = useMemo(() => {
     if (!query.trim()) return groups;
@@ -112,7 +105,7 @@ export default function ModelPick() {
         provider: g.provider,
         group: g.group,
         models: g.models.filter(
-          (m) => m.toLowerCase().includes(q) || g.provider.includes(q) || (g.group ?? "").includes(q),
+          (m) => m.toLowerCase().includes(q),
         ),
       }))
       .filter((g) => g.models.length > 0);
@@ -142,30 +135,10 @@ export default function ModelPick() {
   };
 
   const finish = () => {
-    if (aliasMode) {
-      const targets: AliasTarget[] = rules.map((r) => {
-        const t: AliasTarget = { provider: r.provider, target_model: r.target_model };
-        if (r.group) t.group = r.group;
-        return t;
-      });
-      nav(backTo, { state: { pickedTargets: targets, draftAlias } });
-    } else {
-      nav(backTo, { state: { pickedModels: rules } });
-    }
+    nav(backTo, { state: { pickedModels: rules } });
   };
 
   const goBack = () => {
-    // Preserve in-progress alias form fields even when canceling the picker.
-    if (aliasMode) {
-      nav(backTo, {
-        state: {
-          draftAlias,
-          // Keep previous targets if user backs out without confirming.
-          pickedTargets: initialTargets,
-        },
-      });
-      return;
-    }
     nav(backTo);
   };
 
@@ -199,11 +172,10 @@ export default function ModelPick() {
           <div className="muted">{t("picker.noMatch")}</div>
         ) : (
           filtered.map((g) => {
-            const groupLabel = g.group ? formatTierLabel(t, g.group) : "";
-            const head = g.provider + (groupLabel ? " · " + groupLabel : "");
+            const head = g.provider || t("picker.title");
             const allSelected = g.models.every((m) => selected.has(keyOf(g, m)));
             return (
-              <div className="picker-group" key={head}>
+              <div className="picker-group" key={g.provider + "|" + (g.group ?? "")}>
                 <div className="pg-head">
                   <span>{head}</span>
                   <span className="pg-actions">

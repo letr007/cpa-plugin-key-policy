@@ -459,3 +459,127 @@ func imgKey(s *Store, id string) KeyConfig {
 	}
 	return *k
 }
+
+func TestProviderlessRulesPersistWithoutAliasMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	hash, err := HashKey("cpa_native")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore()
+	cfg := Config{
+		Enabled:   true,
+		StateFile: path,
+		Aliases: []AliasMapping{{
+			Alias:   "gpt-5",
+			Targets: []AliasTarget{{Provider: "codex", TargetModel: "gpt-5-codex"}},
+		}},
+		Keys: []KeyConfig{{
+			ID: "native", Enabled: true, KeyHash: hash,
+			Models:  []ModelRule{{Alias: "gpt-5", TargetModel: "gpt-5"}},
+			Aliases: []KeyAliasRef{{Alias: "gpt-5"}},
+		}},
+	}
+	if err := store.Configure(cfg); err != nil {
+		t.Fatal(err)
+	}
+	keys := store.Keys()
+	if len(keys) != 1 || len(keys[0].Models) != 2 {
+		t.Fatalf("runtime models = %+v, want direct and alias-derived models", keys)
+	}
+	if err := store.saveState(path, keys, nil, store.AliasesSnapshot(), nil); err != nil {
+		t.Fatal(err)
+	}
+	state, err := LoadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := state.Keys[0].Models; len(got) != 1 || got[0].Provider != "" || got[0].Alias != "gpt-5" {
+		t.Fatalf("persisted models = %+v, want only providerless direct rule", got)
+	}
+	// Configure loads persisted keys through normalizeConfig. Verify that path
+	// preserves direct rules before the alias-derived runtime expansion.
+	loaded := Config{Enabled: true, StateFile: path, Keys: state.Keys, Aliases: state.Aliases}
+	if err := normalizeConfig(&loaded); err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.Keys[0].Models; len(got) != 1 || got[0].Provider != "" {
+		t.Fatalf("normalized persisted models = %+v, want providerless direct rule", got)
+	}
+	reloaded := NewStore()
+	if err := reloaded.Configure(Config{Enabled: true, StateFile: path, Keys: state.Keys, Aliases: state.Aliases}); err != nil {
+		t.Fatal(err)
+	}
+	keys = reloaded.Keys()
+	if len(keys) != 1 || len(keys[0].Models) != 2 {
+		t.Fatalf("reloaded runtime models = %+v, want direct and alias-derived models", keys)
+	}
+	var direct, routed bool
+	for _, rule := range keys[0].Models {
+		direct = direct || rule.Provider == "" && rule.TargetModel == "gpt-5"
+		routed = routed || rule.Provider == "codex" && rule.TargetModel == "gpt-5-codex"
+	}
+	if !direct || !routed {
+		t.Fatalf("reloaded rules = %+v, want providerless and routed rules", keys[0].Models)
+	}
+
+	if err := SaveUsageOnly(path, map[string]*UsageState{}); err != nil {
+		t.Fatal(err)
+	}
+	state, err = LoadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := state.Keys[0].Models; len(got) != 1 || got[0].Provider != "" || got[0].TargetModel != "gpt-5" {
+		t.Fatalf("models after usage-only save = %+v, want providerless direct rule", got)
+	}
+}
+
+func TestProviderlessRuleAllowsCaseInsensitiveExactModelName(t *testing.T) {
+	cfg := Config{
+		Enabled: true,
+		Keys: []KeyConfig{{
+			ID:     "native",
+			Models: []ModelRule{{Alias: "GPT-5", TargetModel: "gpt-5"}},
+		}},
+	}
+	if err := normalizeConfig(&cfg); err != nil {
+		t.Fatalf("case-insensitive exact-model rule rejected: %v", err)
+	}
+}
+
+func TestResolveRulePrefersProviderlessExactModelOverSameNamedAlias(t *testing.T) {
+	store := NewStore()
+	key := &KeyConfig{Models: []ModelRule{
+		{Alias: "gpt-5", TargetModel: "gpt-5"},
+		{Alias: "gpt-5", Provider: "codex", TargetModel: "gpt-5-codex"},
+	}}
+	rule, ok := store.resolveRuleForAlias(key, "gpt-5")
+	if !ok || rule.Provider != "" || rule.TargetModel != "gpt-5" {
+		t.Fatalf("resolved rule = %+v ok=%v, want providerless exact model", rule, ok)
+	}
+}
+
+func TestUpsertKeyMergesProviderlessAndAliasDerivedModels(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	store := NewStore()
+	if err := store.Configure(Config{
+		Enabled: true, StateFile: path,
+		Aliases: []AliasMapping{{
+			Alias: "routed", Targets: []AliasTarget{{Provider: "codex", TargetModel: "gpt-5-codex"}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertKey(KeyConfig{
+		ID: "mixed", Enabled: true,
+		Models:  []ModelRule{{Alias: "gpt-5", TargetModel: "gpt-5"}},
+		Aliases: []KeyAliasRef{{Alias: "routed"}},
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	keys := store.Keys()
+	if len(keys) != 1 || len(keys[0].Models) != 2 {
+		t.Fatalf("upserted models = %+v, want direct and alias-derived rules", keys)
+	}
+}

@@ -163,7 +163,9 @@ func (a *App) routeModel(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	rule, keyID, ok := a.store.Route(req.Headers, req.Query, req.RequestedModel)
-	if !ok {
+	if !ok || rule.Provider == "" {
+		// Provider-less rules authorize the exact model name but intentionally
+		// leave selection to CPA's native router.
 		return OKEnvelope(ModelRouteResponse{Handled: false})
 	}
 	return OKEnvelope(ModelRouteResponse{
@@ -688,6 +690,12 @@ func (a *App) patchKey(body []byte) ManagementResponse {
 	}
 	if req.Models != nil {
 		current.Models = req.Models
+		// The model list is authoritative for the standard key form. Clear the
+		// carried runtime alias refs so removed legacy routed rules do not survive;
+		// provider-backed entries in Models are migrated back into refs below.
+		if req.Aliases == nil {
+			current.Aliases = nil
+		}
 	}
 	if req.Aliases != nil {
 		current.Aliases = req.Aliases

@@ -809,3 +809,119 @@ func TestSafePluginCallRecoversPanic(t *testing.T) {
 		t.Fatalf("safePluginCall response=%q error=%v", response, err)
 	}
 }
+
+func TestAppProviderlessRuleDefersToNativeRouting(t *testing.T) {
+	app := NewApp()
+	plain := "cpa_native_model"
+	hash := hashForTest(t, plain)
+	yaml := []byte(`
+enabled: true
+state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
+keys:
+  - id: native
+    enabled: true
+    key_hash: "` + hash + `"
+    models:
+      - alias: gpt-5
+        provider: ""
+        target_model: gpt-5
+`)
+	req, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
+	if _, err := app.HandleMethod(MethodPluginReconfigure, req); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+
+	routeReq, _ := json.Marshal(ModelRouteRequest{
+		RequestedModel: "gpt-5",
+		Headers:        http.Header{"Authorization": {"Bearer " + plain}},
+	})
+	raw, err := app.HandleMethod(MethodModelRoute, routeReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := routeResponseFromEnvelope(t, raw); response.Handled {
+		t.Fatalf("provider-less rule must defer to native routing: %+v", response)
+	}
+}
+
+func TestPatchKeyModelsReplaceLegacyAliasRefs(t *testing.T) {
+	app := NewApp()
+	plain := "cpa_replace_models"
+	hash := hashForTest(t, plain)
+	yaml := []byte(`
+enabled: true
+state_file: "` + filepath.ToSlash(filepath.Join(t.TempDir(), "state.json")) + `"
+aliases:
+  - alias: legacy
+    targets:
+      - provider: codex
+        target_model: gpt-5-codex
+keys:
+  - id: replace
+    enabled: true
+    key_hash: "` + hash + `"
+    aliases:
+      - alias: legacy
+`)
+	reqCfg, _ := json.Marshal(LifecycleRequest{ConfigYAML: yaml})
+	if _, err := app.HandleMethod(MethodPluginReconfigure, reqCfg); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]any{
+		"id": "replace",
+		"models": []map[string]any{{
+			"alias":        "gpt-5",
+			"provider":     "",
+			"target_model": "gpt-5",
+		}},
+	})
+	mgmtReq, _ := json.Marshal(ManagementRequest{
+		Method: http.MethodPatch,
+		Path:   "/v0/management/plugins/cpa-key-policy/keys",
+		Body:   body,
+	})
+	raw, err := app.HandleMethod(MethodManagementHandle, mgmtReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := managementResponseFromEnvelope(t, raw)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, string(resp.Body))
+	}
+	keys := app.store.Keys()
+	if len(keys) != 1 || len(keys[0].Aliases) != 0 || len(keys[0].Models) != 1 || keys[0].Models[0].Provider != "" {
+		t.Fatalf("patched key retained legacy routing: %+v", keys)
+	}
+}
+
+func TestProviderlessRuleRequiresExactModelAuthorization(t *testing.T) {
+	for name, yaml := range map[string][]byte{
+		"alias differs": []byte(`
+enabled: true
+keys:
+  - id: native
+    key_hash: x
+    models:
+      - alias: shortcut
+        provider: ""
+        target_model: gpt-5
+`),
+		"group set": []byte(`
+enabled: true
+keys:
+  - id: native
+    key_hash: x
+    models:
+      - alias: gpt-5
+        provider: ""
+        target_model: gpt-5
+        group: team
+`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := policy.DecodeConfig(yaml); err == nil {
+				t.Fatal("expected invalid provider-less rule to be rejected")
+			}
+		})
+	}
+}

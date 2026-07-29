@@ -92,7 +92,6 @@ function Shell() {
         <Route path="/keys/new/models" element={<ModelPick />} />
         <Route path="/keys/:id/edit" element={<KeyEdit />} />
         <Route path="/keys/:id/edit/models" element={<ModelPick />} />
-        <Route path="/mapping/pick-target" element={<ModelPick />} />
         <Route path="/keys/:id/usage" element={<KeyUsage />} />
         <Route path="/mapping" element={<Mapping />} />
         <Route path="/mapping/alias/:aliasName" element={<AliasEditForm />} />

@@ -94,16 +94,15 @@ describe("ModelPicker empty-catalog guard", () => {
       await tick();
     });
 
-    // After load, it emits exactly the selected rule (alias = model name).
+    // After load, the existing routed rule is preserved verbatim, including
+    // pricing fields; only newly selected global rows become providerless.
     expect(calls.length).toBe(1);
-    expect(calls[0]).toEqual([
-      { alias: "grok-composer-2.5-fast", provider: "xai", target_model: "grok-composer-2.5-fast" },
-    ]);
+    expect(calls[0]).toEqual(initial);
   });
 });
 
-describe("ModelPicker tier grouping", () => {
-  it("emits group when a model is selected under a tier subgroup", async () => {
+describe("ModelPicker global catalog", () => {
+  it("emits a providerless exact-model rule for a selected global model", async () => {
     let resolveCatalog: (v: { provider: string; model: string; group?: string }[]) => void = () => {};
     (fetchCatalog as ReturnType<typeof vi.fn>).mockImplementation(
       () => new Promise((res) => (resolveCatalog = res)),
@@ -119,10 +118,7 @@ describe("ModelPicker tier grouping", () => {
     });
 
     await act(async () => {
-      resolveCatalog([
-        { provider: "codex", group: "free", model: "gpt-5-codex" },
-        { provider: "codex", group: "team", model: "gpt-5-codex" },
-      ]);
+      resolveCatalog([{ provider: "", model: "gpt-5-codex" }]);
       await tick();
     });
 
@@ -130,34 +126,26 @@ describe("ModelPicker tier grouping", () => {
     expect(calls.length).toBe(1);
     expect(calls[0]).toEqual([]);
 
-    // Toggle the team-tier row of gpt-5-codex. The first checkbox in render
-    // order is the free-tier row; the team row is second. Click the team one
-    // to assert the emitted rule carries group:"team" so the plugin Scheduler
-    // pins the request to a team auth file.
     const checkboxes = Array.from(
       container.querySelectorAll("input[type=checkbox]"),
     ) as HTMLInputElement[];
-    expect(checkboxes.length).toBe(2);
+    expect(checkboxes.length).toBe(1);
     await act(async () => {
-      checkboxes[1].click(); // team-tier gpt-5-codex
+      checkboxes[0].click();
       await tick();
     });
 
     const last = calls[calls.length - 1];
     expect(last).toEqual([
-      { alias: "gpt-5-codex", provider: "codex", target_model: "gpt-5-codex", group: "team" },
+      { alias: "gpt-5-codex", provider: "", target_model: "gpt-5-codex" },
     ]);
   });
 });
 
-describe("ModelPicker legacy preselect preservation", () => {
-  it("keeps a group-less codex rule that the new catalog no longer covers", async () => {
-    // A key created before tier grouping shipped stored codex rows with no
-    // group. The new catalog lists codex only under tier subgroups, so the
-    // preselected "codex||gpt-5-codex" key matches no checkbox. The picker must
-    // NOT silently drop it on emit — that would delete the model from the key
-    // when the user saves. It re-emits the stale entry verbatim (group stays
-    // empty = legacy "any codex auth", the plugin Scheduler defers).
+describe("ModelPicker legacy rule preservation", () => {
+  it("keeps a routed legacy rule the global catalog no longer covers", async () => {
+    // A routed rule may no longer be listed by the global native catalog. It
+    // must survive picker emission until a user explicitly removes it.
     const legacyInitial: ModelRule[] = [
       { alias: "gpt-5-codex", provider: "codex", target_model: "gpt-5-codex" },
     ];
@@ -191,5 +179,32 @@ describe("ModelPicker legacy preselect preservation", () => {
       provider: "codex",
       target_model: "gpt-5-codex",
     });
+  });
+
+  it("keeps missing providerless rules and multiple aliases for one target", async () => {
+    const legacyInitial: ModelRule[] = [
+      { alias: "gpt-5", provider: "", target_model: "gpt-5", per_call_usd: 1 },
+      { alias: "fast", provider: "codex", target_model: "gpt-5-codex" },
+      { alias: "backup", provider: "codex", target_model: "gpt-5-codex" },
+    ];
+    let resolveCatalog: (v: { provider: string; model: string; group?: string }[]) => void = () => {};
+    (fetchCatalog as ReturnType<typeof vi.fn>).mockImplementation(
+      () => new Promise((res) => (resolveCatalog = res)),
+    );
+
+    const calls: ModelRule[][] = [];
+    await act(async () => {
+      root = createRoot(container);
+      root.render(<ModelPicker initial={legacyInitial} onChange={(rules) => calls.push([...rules])} />);
+      await tick();
+    });
+    await act(async () => {
+      resolveCatalog([{ provider: "", model: "other-model" }]);
+      await tick();
+    });
+
+    const last = calls[calls.length - 1];
+    expect(last).toEqual(expect.arrayContaining(legacyInitial));
+    expect(last.filter((rule) => rule.target_model === "gpt-5-codex")).toHaveLength(2);
   });
 });

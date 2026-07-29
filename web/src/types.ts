@@ -3,13 +3,12 @@
 
 export interface ModelRule {
   alias: string;
+  // Empty provider is a model-name-only authorization rule. CPA routes those
+  // natively; non-empty values remain supported for legacy routed rules.
   provider: string;
   target_model: string;
-  // Optional tier/plan narrowing for providers whose auth files carry an
-  // identity claim (codex plan_type, antigravity tier). Empty = "any file for
-  // the provider" (legacy). The plugin's Scheduler filters auth candidates by
-  // this so a downstream key pinned to, say, codex "team" only ever lands on a
-  // team auth file. UI catalog groups mirror this value.
+  // Empty for model-name-only authorization rules. Non-empty values preserve
+  // legacy provider-specific scheduler narrowing.
   group?: string;
   input_price_per_million?: number;
   output_price_per_million?: number;
@@ -124,13 +123,10 @@ export interface KeyUsageResponse {
   aliases: AliasUsageEntry[];
 }
 
-// A model the user can pick when creating/editing a key.
+// A model the user can pick when creating/editing a key. The global catalog
+// deliberately leaves provider and group empty so CPA owns routing.
 export interface CatalogModel {
   provider: string;
-  // group is set for providers whose auth files carry a tier/plan identity
-  // (codex plan_type, antigravity tier). Same model may appear under several
-  // groups when multiple tiers' auth files all support it — each is a distinct
-  // selectable row pinning a different tier.
   group?: string;
   model: string;
 }

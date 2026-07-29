@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useNavigate, useParams, useLocation } from "react-router-dom";
 import { useT } from "../i18n";
-import type { AliasMapping, AliasTarget, ClassifyRule, ClassifyPreviewResponse, CredentialDescriptor } from "../types";
+import type { AliasMapping, ClassifyRule, ClassifyPreviewResponse, CredentialDescriptor } from "../types";
 import { fetchAliases, upsertAlias, deleteAlias, fetchClassifyRules, upsertClassifyRule, deleteClassifyRule, reorderClassifyRules, classifyPreview, fetchCredentialDescriptors } from "../api/mappings";
 
 export default function Mapping() {
@@ -9,7 +9,7 @@ export default function Mapping() {
   const loc = useLocation();
   const [tab, setTab] = useState<"alias" | "classify">("alias");
 
-  // Pick up returned state (new targets from ModelPick, etc.)
+  // Pick up returned navigation state.
   useEffect(() => {
     if (loc.state?.mappingTab) setTab(loc.state.mappingTab);
   }, [loc.state]);
@@ -374,16 +374,15 @@ export function AliasEditForm() {
   const loc = useLocation();
   const isNew = aliasName === "new" || !aliasName;
 
-  const locState = loc.state as { draftAlias?: AliasMapping; pickedTargets?: AliasTarget[] } | null;
+  const locState = loc.state as { draftAlias?: AliasMapping } | null;
   const returnDraft = locState?.draftAlias;
-  const returnTargets = locState?.pickedTargets;
 
   const [alias, setAlias] = useState<AliasMapping>(() => {
     const draft = returnDraft ?? readAliasFormDraft();
     if (draft) {
       return {
         ...draft,
-        targets: returnTargets ?? draft.targets ?? [],
+        targets: draft.targets ?? [],
       };
     }
     return {
@@ -399,6 +398,8 @@ export function AliasEditForm() {
   });
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [targetProvider, setTargetProvider] = useState("");
+  const [targetModel, setTargetModel] = useState("");
 
   // Keep session draft in sync while editing so a picker trip never loses fields.
   useEffect(() => {
@@ -419,15 +420,6 @@ export function AliasEditForm() {
     }).catch((e: unknown) => setError(String(e)));
   }, [aliasName, isNew, returnDraft]);
 
-  // Apply targets returned from ModelPick (draft fields come from session/router).
-  useEffect(() => {
-    if (!returnTargets) return;
-    setAlias((prev) => {
-      const base = returnDraft ?? prev;
-      return { ...base, targets: returnTargets };
-    });
-  }, [returnTargets, returnDraft]);
-
   const leaveForm = (toMapping = true) => {
     clearAliasFormDraft();
     if (toMapping) nav("/mapping", { state: { mappingTab: "alias" } });
@@ -447,16 +439,15 @@ export function AliasEditForm() {
   };
 
   const addTarget = () => {
-    // Persist draft before leaving so name/dispatch/pricing survive the picker.
-    writeAliasFormDraft(alias);
-    const here = `/mapping/alias/${isNew ? "new" : encodeURIComponent(alias.alias || aliasName || "new")}`;
-    nav("/mapping/pick-target", {
-      state: {
-        returnTo: here,
-        currentTargets: alias.targets,
-        draftAlias: alias,
-      },
-    });
+    const provider = targetProvider.trim();
+    const model = targetModel.trim();
+    if (!provider || !model) return;
+    setAlias((prev) => ({
+      ...prev,
+      targets: [...prev.targets, { provider, target_model: model }],
+    }));
+    setTargetProvider("");
+    setTargetModel("");
   };
 
   const removeTarget = (idx: number) => {
@@ -513,7 +504,23 @@ export function AliasEditForm() {
               </div>
             ))}
           </div>
-          <button className="btn" onClick={addTarget}>+ {t("mapping.alias.addTarget")}</button>
+          <div className="map-form-target-row">
+            <input
+              className="mono"
+              value={targetProvider}
+              onChange={(e) => setTargetProvider(e.target.value)}
+              placeholder="provider"
+            />
+            <input
+              className="mono"
+              value={targetModel}
+              onChange={(e) => setTargetModel(e.target.value)}
+              placeholder="model"
+            />
+            <button className="btn" type="button" onClick={addTarget} disabled={!targetProvider.trim() || !targetModel.trim()}>
+              + {t("mapping.alias.addTarget")}
+            </button>
+          </div>
         </div>
         <div className="map-form-row">
           <label>{t("mapping.alias.billing")}</label>

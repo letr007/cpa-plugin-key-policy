@@ -305,17 +305,10 @@ func DecodeConfig(raw []byte) (Config, error) {
 	return cfg, nil
 }
 
-// migrateModelsToAliases promotes per-key ModelRule entries to the global
-// AliasMapping table. For each key that has Models but no Aliases, each
-// ModelRule is looked up by ALIAS NAME in the global table (not the
-// full alias+provider+target_model tuple, so a multi-target alias already
-// defined in the global table is reused wholesale rather than split into
-// duplicate global aliases). If the alias name is unknown, a new single-
-// target alias is created from this ModelRule's target. Per-key refs are
-// deduped by alias name (a key referencing a multi-target alias gets ONE
-// ref, so resolveAliasRefsToModels expands it to all the alias's targets).
-// After migration, the key's Models slice is cleared (the canonical source
-// becomes Aliases). Keys that already have Aliases are left untouched.
+// migrateModelsToAliases promotes provider-backed ModelRule entries to the
+// global AliasMapping table. Providerless exact-model rules are per-key native
+// routing allowlist entries, so they stay in KeyConfig.Models and never merge
+// with an AliasMapping of the same name.
 func migrateModelsToAliases(cfg *Config) {
 	if len(cfg.Keys) == 0 {
 		return
@@ -328,30 +321,37 @@ func migrateModelsToAliases(cfg *Config) {
 	}
 	for i := range cfg.Keys {
 		key := &cfg.Keys[i]
-		if len(key.Models) == 0 {
-			// No Models to migrate. Leave existing Aliases intact — this is the
-			// normal reload path where Models is a derived field (stripped from
-			// disk by SaveState and repopulated in memory by Configure). Only the
-			// PATCH path sends non-nil Models, and an explicit clear sends Models
-			// as an empty non-nil slice which still falls through to the
-			// reconciliation below and correctly drops all alias refs.
+		if key.Models == nil {
+			// Alias-backed Models are derived and omitted from persisted state.
+			// An absent Models field therefore leaves existing alias refs intact.
 			continue
 		}
-		// Build the set of alias names present in this key's Models — this is
-		// the authoritative list the user wants. Reconcile the key's existing
-		// Aliases against it: keep refs whose alias still has a Model entry,
-		// drop refs whose alias was removed, and add refs for newly added
-		// alias names. Price overrides on surviving refs are preserved.
-		modelAliasNames := make(map[string]struct{}, len(key.Models))
+		// Providerless rules remain direct per-key authorization entries. Only
+		// provider-backed rules participate in alias reconciliation and migration.
+		directModels := make([]ModelRule, 0, len(key.Models))
+		providerModels := make([]ModelRule, 0, len(key.Models))
 		for _, m := range key.Models {
+			if isProviderlessModelRule(m) {
+				directModels = append(directModels, m)
+				continue
+			}
+			providerModels = append(providerModels, m)
+		}
+		modelAliasNames := make(map[string]struct{}, len(providerModels))
+		for _, m := range providerModels {
 			modelAliasNames[strings.ToLower(m.Alias)] = struct{}{}
 		}
 		var reconciled []KeyAliasRef
 		refSeen := map[string]struct{}{} // dedup reconciled by alias name
 		for _, ref := range key.Aliases {
 			lk := strings.ToLower(ref.Alias)
-			if _, ok := modelAliasNames[lk]; !ok {
-				continue // this alias was removed from the key's models
+			// A Models payload containing only direct providerless rules carries
+			// no alias-derived entries to reconcile. Keep explicit alias refs so
+			// those two independent authorization forms can coexist.
+			if len(providerModels) > 0 {
+				if _, ok := modelAliasNames[lk]; !ok {
+					continue // this alias was removed from the routed model set
+				}
 			}
 			if _, dup := refSeen[lk]; dup {
 				continue // dedup
@@ -359,7 +359,7 @@ func migrateModelsToAliases(cfg *Config) {
 			refSeen[lk] = struct{}{}
 			reconciled = append(reconciled, ref) // preserve price overrides
 		}
-		for _, m := range key.Models {
+		for _, m := range providerModels {
 			al := strings.ToLower(m.Alias)
 			target := AliasTarget{Provider: m.Provider, TargetModel: m.TargetModel, Group: m.Group}
 			var ai int
@@ -401,8 +401,9 @@ func migrateModelsToAliases(cfg *Config) {
 			reconciled = append(reconciled, KeyAliasRef{Alias: m.Alias})
 		}
 		key.Aliases = reconciled
-		// Clear Models — the canonical source is now Aliases.
-		key.Models = nil
+		// Alias-backed Models are derived at runtime; retain only native-routing
+		// providerless rules as canonical per-key state.
+		key.Models = directModels
 	}
 }
 
@@ -411,6 +412,20 @@ func migrateModelsToAliases(cfg *Config) {
 // multi-target aliases — submitted as multiple ModelRules sharing one
 // alias name — accumulate all their targets into a single global
 // AliasMapping during migration.
+func isProviderlessModelRule(rule ModelRule) bool {
+	return strings.TrimSpace(rule.Provider) == ""
+}
+
+func providerlessModelRules(rules []ModelRule) []ModelRule {
+	var direct []ModelRule
+	for _, rule := range rules {
+		if isProviderlessModelRule(rule) {
+			direct = append(direct, rule)
+		}
+	}
+	return direct
+}
+
 func mergeAliasTarget(a *AliasMapping, target AliasTarget) {
 	for _, t := range a.Targets {
 		if strings.EqualFold(t.Provider, target.Provider) &&
@@ -460,8 +475,11 @@ func normalizeConfig(cfg *Config) error {
 			model.Provider = strings.ToLower(strings.TrimSpace(model.Provider))
 			model.TargetModel = strings.TrimSpace(model.TargetModel)
 			model.Group = strings.ToLower(strings.TrimSpace(model.Group))
-			if model.Alias == "" || model.Provider == "" || model.TargetModel == "" {
-				return fmt.Errorf("key %q model entries require alias, provider, and target_model", key.ID)
+			if model.Alias == "" || model.TargetModel == "" {
+				return fmt.Errorf("key %q model entries require alias and target_model", key.ID)
+			}
+			if model.Provider == "" && (!strings.EqualFold(model.Alias, model.TargetModel) || model.Group != "") {
+				return fmt.Errorf("key %q model %q without provider requires alias equal to target_model and an empty group", key.ID, model.Alias)
 			}
 			// NOTE: duplicate alias names within a key's Models are LEGITIMATE
 			// for multi-target global aliases (resolveAliasRefsToModels emits
@@ -505,8 +523,11 @@ func normalizeConfig(cfg *Config) error {
 			t.Provider = strings.ToLower(strings.TrimSpace(t.Provider))
 			t.TargetModel = strings.TrimSpace(t.TargetModel)
 			t.Group = strings.ToLower(strings.TrimSpace(t.Group))
-			if t.Provider == "" || t.TargetModel == "" {
-				return fmt.Errorf("alias %q target %d: provider and target_model are required", a.Alias, j)
+			if t.TargetModel == "" {
+				return fmt.Errorf("alias %q target %d: target_model is required", a.Alias, j)
+			}
+			if t.Provider == "" && (!strings.EqualFold(a.Alias, t.TargetModel) || t.Group != "") {
+				return fmt.Errorf("alias %q target %d without provider requires alias equal to target_model and an empty group", a.Alias, j)
 			}
 		}
 		switch strings.ToLower(strings.TrimSpace(a.Dispatch)) {
@@ -663,17 +684,13 @@ func SaveState(path string, keys []KeyConfig, usage map[string]*UsageState, alia
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	// Models is a DERIVED field (resolved from Aliases × global table via
-	// resolveAliasRefsToModels); the canonical source is Aliases. Persisting
-	// it would (a) make the on-disk state drift from the live in-memory copy
-	// when the global alias table is edited, and (b) re-trigger validation
-	// errors on reload — multi-target aliases expand to multiple ModelRules
-	// sharing one alias name, which legacy validation could not tolerate.
-	// Strip Models before marshalling; Configure repopulates it on load.
+	// Provider-backed Models are derived from Alias refs and must not be
+	// persisted. Providerless exact-model rules are direct per-key native-routing
+	// allowlists, so retain only those entries for reload.
 	cleanKeys := make([]KeyConfig, len(keys))
 	for i := range keys {
 		cleanKeys[i] = keys[i]
-		cleanKeys[i].Models = nil
+		cleanKeys[i].Models = providerlessModelRules(keys[i].Models)
 	}
 	state := State{Version: 1, Keys: cleanKeys, Usage: usage, UpdatedAt: time.Now().UTC(), Aliases: aliases, ClassifyRules: rules}
 	raw, err := json.MarshalIndent(state, "", "  ")
@@ -706,11 +723,10 @@ func SaveUsageOnly(path string, usage map[string]*UsageState) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	// Strip the derived Models field from every key (see SaveState for why).
-	// On-disk Models may contain pre-fix duplicates from multi-target aliases;
-	// repersisting them would re-trigger the bug on the next reload.
+	// Keep direct providerless allowlist entries and discard any legacy
+	// provider-backed Models that should be derived from Alias refs.
 	for i := range keys {
-		keys[i].Models = nil
+		keys[i].Models = providerlessModelRules(keys[i].Models)
 	}
 	state := State{Version: 1, Keys: keys, Usage: usage, UpdatedAt: time.Now().UTC(), Aliases: aliases, ClassifyRules: rules}
 	raw, err := json.MarshalIndent(state, "", "  ")
