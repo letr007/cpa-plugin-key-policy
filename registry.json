@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "cpa-key-policy",
+      "name": "CPA Key Policy",
+      "description": "Manages plugin-owned downstream API keys with model allowlists, aliases, rate limits, budgets, and an embedded management UI.",
+      "author": "letr007",
+      "version": "0.4.5",
+      "repository": "https://github.com/letr007/cpa-plugin-key-policy",
+      "homepage": "https://github.com/letr007/cpa-plugin-key-policy",
+      "license": "MIT",
+      "tags": [
+        "Management",
+        "Auth"
+      ]
+    }
+  ]
+}
